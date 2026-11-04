@@ -101,9 +101,10 @@
 
   - name: Notification templates
     copy:
-      src: "files/{{ service }}/templates/"
-      dest: "{{ dir_compose }}/notifications/"
+      src: "files/{{ service }}/templates/{{ item }}/"
+      dest: "{{ dir_compose }}/notifications/{{ item }}/"
       mode: '0644'
+    loop: [ru, en]
     register: traccar_templates
 
   - name: tracksms config (токен бота, устройства → чаты)
