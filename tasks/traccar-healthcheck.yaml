@@ -1,0 +1,24 @@
+# Traccar поднимается 20–60 с: миграции базы, затем открываются порты протоколов и веб
+- name: Traccar web
+  uri:
+    url: "http://127.0.0.1:{{ traccar_web_port }}/"
+    status_code: 200
+  register: web
+  until: web.status == 200
+  retries: 40
+  delay: 3
+
+- name: Protocol ports are listening
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ item }}"
+    state: started
+    timeout: 60
+  loop: "{{ [traccar_osmand_port] + (traccar_published_ports | rejectattr('proto', 'equalto', 'udp') | map(attribute='host') | unique | list) }}"
+
+- name: tracksms
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ tracksms_port }}"
+    state: started
+    timeout: 60

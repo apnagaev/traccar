@@ -1,0 +1,106 @@
+# Скопируйте в vars/traccar.yml и заполните. Зашифровать: ansible-vault encrypt vars/traccar.yml
+
+# Версия образа traccar/traccar: latest или конкретная (теги вида 6.17.0, https://www.traccar.org/docker/).
+# Traccar обновляет схему общей базы при старте: узлы обновляются строго по очереди, первым — узел 1.
+# С 6.17 порты протоколов при первом запуске записываются в базу; дальше *.port в traccar.xml их не меняют
+# (меняются в разделе протоколов администратора).
+traccar_version: "latest"
+
+traccar_hostname: traccar.example.com
+traccar_tz: Europe/Moscow
+dns_server: 10.0.0.1
+traccar_subnet: 172.28.1.144/28
+traccar_web_url: https://track.example.com/          # ссылки в уведомлениях и письмах
+
+# Порты. Внутренние (порт контейнера) задаются в traccar.xml; host — публикация на узле.
+traccar_web_port: 82                                # веб и API — только для reverse proxy (firewall)
+traccar_osmand_port: 15055                          # телефоны (OsmAnd / Traccar Client) — только для reverse proxy (firewall)
+traccar_protocol_ports:                             # протоколы трекеров: имя в traccar.xml → порт контейнера
+  h02: 15013
+  watch: 15093
+  teltonika: 15027
+  egts: 15162
+# Публикация портов трекеров (открыты в интернет). proto: tcp, udp или both.
+traccar_published_ports:
+  - { host: 15013, container: 15013, proto: tcp }   # h02
+  - { host: 15093, container: 15093, proto: tcp }   # watch
+  - { host: 15027, container: 15027, proto: both }  # teltonika
+  - { host: 5027,  container: 15027, proto: both }  # teltonika, стандартный порт
+  - { host: 15162, container: 15162, proto: tcp }   # egts
+  - { host: 5144,  container: 5144,  proto: tcp }   # owntracks (порт по умолчанию)
+  - { host: 5064,  container: 5064,  proto: tcp }   # eelink (порт по умолчанию)
+  - { host: 5015,  container: 5015,  proto: tcp }   # huabao (порт по умолчанию)
+
+# Каталоги на хосте
+traccar_media_dir: /traccar/media                   # фото и аудио от устройств
+traccar_logs_dir: /traccar/logs                     # журналы Traccar (ротация по дням)
+traccar_logs_keep_days: 30                          # срок хранения журналов (политика ПДн: 30 дней)
+
+# База MySQL / MariaDB
+traccar_db_host: db.example.com
+traccar_db_port: 3306
+traccar_db_name: traccar
+traccar_db_user: traccar
+traccar_db_password: CHANGE_ME
+
+# Синхронизация узлов (живые обновления в браузере при работе с любым узлом)
+traccar_broadcast_redis: redis://10.0.0.5:6379/6
+# Регламентные задачи (отчёты по расписанию и т. п.) выполняет только узел с node: 1.
+
+# Статус «неизвестно», если устройство молчит дольше, секунд. Должно быть больше самого редкого
+# интервала отправки при неподвижности у телефонов (профиль «Минимальный» — 3600 с).
+traccar_status_timeout: 3900
+
+# Новые пользователи: пробный период
+traccar_user_expiration_days: 8
+traccar_user_device_limit: 2
+
+# Автоматическая регистрация неизвестных устройств с идентификатором, подходящим под регулярное выражение
+traccar_register_unknown: true
+traccar_register_unknown_regex: '.*example\.com'
+traccar_register_unknown_group_id: 10
+
+# Вход через Keycloak (OpenID Connect)
+keycloak_url: https://sso.example.com
+keycloak_realm: myrealm
+traccar_openid_client_id: traccar
+traccar_openid_client_secret: CHANGE_ME
+traccar_openid_allow_group: traccar_user
+traccar_openid_admin_group: traccar_admin
+
+# Адреса (обратное геокодирование), LocationIQ в режиме nominatim
+traccar_geocoder_url: https://eu1.locationiq.com/v1/reverse.php
+traccar_geocoder_key: CHANGE_ME
+traccar_geocoder_on_request: false                  # true + ignore_positions: true — адреса только в отчётах и уведомлениях
+traccar_geocoder_ignore_positions: false
+
+# Местоположение по вышкам и Wi-Fi (Google Geolocation API, платный сверх бесплатного объёма)
+traccar_geolocation_key: CHANGE_ME
+
+# Ограничения скорости по OSM
+traccar_speedlimit_url: https://overpass-api.de/api/interpreter
+
+# Почта
+traccar_smtp_host: smtp.example.com
+traccar_smtp_port: 465
+traccar_smtp_from: track@example.com
+traccar_smtp_user: robot@example.com
+traccar_smtp_password: CHANGE_ME
+
+# Push-уведомления в приложение Traccar Manager (ключ из https://www.traccar.org/notifications/)
+traccar_push_key: CHANGE_ME
+
+# Telegram: бот для уведомлений Traccar и для tracksms
+telegram_bot_token: CHANGE_ME
+telegram_chat_id: "-100000000000"                   # чат по умолчанию
+
+# tracksms: «SMS»-уведомления, которые на самом деле уходят в Telegram-чаты по устройствам
+tracksms_build_dir: /traccar/tracksms               # исходники контейнера на узлах
+tracksms_port: 8000                                 # только для внутренней сети (firewall)
+tracksms_devices:                                   # устройство (id в Traccar) → телефон пользователя и чат
+  - { devid: "1", userphone: "70000000000", chatid: "-100000000001" }
+
+# Firewall: веб, OsmAnd и tracksms доступны только узлам, Docker-сетям и этим сетям (reverse proxy, мониторинг).
+# Порты трекеров открыты всем.
+firewall: true
+trusted_nets: [10.0.0.0/16]

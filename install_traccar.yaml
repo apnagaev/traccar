@@ -1,0 +1,196 @@
+# Traccar на двух узлах: GPS-мониторинг (веб, приложения, уведомления), вход через Keycloak, общая база MySQL/MariaDB.
+# Плюс tracksms — рассылка «SMS»-уведомлений Traccar в Telegram-чаты по устройствам.
+# Узлы обновляются строго по очереди: узел 1 → проверка → узел 2 → проверка.
+# Запуск: ansible-playbook -i inventory.yml install_traccar.yaml [--ask-vault-pass]
+
+# Факты (IP) со всех узлов до основного прохода: при serial: 1 Ansible собирает их только с текущего узла,
+# а в правилах firewall нужны адреса обоих (cluster_nodes).
+- name: Gather facts from all nodes
+  hosts: docker
+  gather_facts: yes
+  tasks: []
+
+- name: Traccar
+  hosts: docker
+  become: yes
+  serial: 1                                   # по одному узлу: сломанный релиз не уронит оба
+  order: sorted
+  vars_files:
+    - vars/traccar.yml                        # пример: vars/traccar.example.yml
+  vars:
+    service: traccar
+    dir_compose: "/docker-compose/{{ service }}"
+    cluster_nodes: "{{ groups['docker'] | map('extract', hostvars, ['ansible_facts', 'default_ipv4', 'address']) | list }}"
+    # свои шаблоны уведомлений (files/traccar/templates/<язык>/<событие>.vm) — подключаются по одному файлу,
+    # остальные штатные шаблоны образа остаются
+    notification_templates: "{{ (query('fileglob', playbook_dir ~ '/files/traccar/templates/ru/*.vm')
+                                 + query('fileglob', playbook_dir ~ '/files/traccar/templates/en/*.vm')) | sort }}"
+  tasks:
+
+  # ------------------------------------------------------------------ firewall
+  - name: Firewall
+    when: firewall
+    block:
+      - name: Install nftables
+        apt:
+          name: nftables
+          state: present
+
+      - name: Enable nftables at boot (without restart!)
+        systemd:
+          name: nftables
+          enabled: yes
+
+      - name: Include /etc/nftables.d at boot
+        lineinfile:
+          path: /etc/nftables.conf
+          line: 'include "/etc/nftables.d/*.nft"'
+          create: yes
+
+      - name: Create /etc/nftables.d
+        file:
+          path: /etc/nftables.d
+          state: directory
+
+      - name: Render firewall rules
+        template:
+          src: "files/{{ service }}/{{ service }}.nft.j2"
+          dest: "/etc/nftables.d/{{ service }}.nft"
+          validate: "nft -c -f %s"
+        register: nft_rules
+
+      - name: Apply firewall rules
+        command: "nft -f /etc/nftables.d/{{ service }}.nft"
+        when: nft_rules.changed
+
+  # ------------------------------------------------------------------ файлы
+  # 0750: внутри секреты, телефоны и чаты пользователей
+  - name: Compose directory
+    file:
+      path: "{{ dir_compose }}"
+      state: directory
+      mode: '0750'
+
+  - name: Host directories (logs, media)
+    file:
+      path: "{{ item }}"
+      state: directory
+    loop:
+      - "{{ traccar_logs_dir }}"
+      - "{{ traccar_media_dir }}"
+
+  - name: docker-compose.yaml
+    template:
+      src: "files/{{ service }}/{{ service }}.yaml.j2"
+      dest: "{{ dir_compose }}/docker-compose.yaml"
+      mode: '0644'
+
+  - name: traccar.xml (без секретов)
+    template:
+      src: "files/{{ service }}/traccar.xml.j2"
+      dest: "{{ dir_compose }}/traccar.xml"
+      mode: '0644'
+    register: traccar_xml
+
+  # секреты Traccar — переменными окружения, только владельцу
+  - name: traccar.env
+    template:
+      src: "files/{{ service }}/traccar.env.j2"
+      dest: "{{ dir_compose }}/traccar.env"
+      mode: '0600'
+
+  - name: Notification templates
+    copy:
+      src: "files/{{ service }}/templates/"
+      dest: "{{ dir_compose }}/notifications/"
+      mode: '0644'
+    register: traccar_templates
+
+  - name: tracksms config (токен бота, устройства → чаты)
+    template:
+      src: "files/{{ service }}/{{ item }}.j2"
+      dest: "{{ dir_compose }}/{{ item }}"
+      mode: '0640'
+    loop:
+      - smsconf.txt
+      - userdevices.txt
+    register: tracksms_conf
+
+  # прежняя версия плейбука копировала весь files/traccar: файлы trackmiddle (с ключами Яндекса),
+  # копию compose и шаблоны уведомлений формата до 6.x (templates/short, full), которые не подключались
+  - name: Remove legacy files
+    file:
+      path: "{{ dir_compose }}/{{ item }}"
+      state: absent
+    loop:
+      - traccar.yaml
+      - ip.txt
+      - conf.txt
+      - fail.txt
+      - true.txt
+      - templates
+
+  # журналы Traccar ротируются по дням, но сами не удаляются
+  - name: Delete old Traccar logs daily
+    cron:
+      name: "{{ service }} logs cleanup"
+      minute: "17"
+      hour: "4"
+      job: "find {{ traccar_logs_dir }} -type f -mtime +{{ traccar_logs_keep_days }} -delete"
+      cron_file: "{{ service }}-logs"
+      user: root
+
+  # ------------------------------------------------------------------ образы и запуск
+  - name: Pull images
+    command: docker compose pull --quiet --ignore-buildable
+    args:
+      chdir: "{{ dir_compose }}"
+    register: pull
+    retries: 3
+    delay: 15
+    until: pull.rc == 0
+    changed_when: false
+
+  - name: Build tracksms
+    command: docker compose build --quiet
+    args:
+      chdir: "{{ dir_compose }}"
+    changed_when: false
+
+  # up -d пересоздаёт только изменившиеся контейнеры: без down нет лишнего простоя
+  - name: Start / update containers
+    command: docker compose up -d --remove-orphans
+    args:
+      chdir: "{{ dir_compose }}"
+    register: up
+    retries: 3                                # «port is already allocated» сразу после пересоздания
+    delay: 10
+    until: up.rc == 0
+    changed_when: "'Recreate' in up.stderr or 'Created' in up.stderr"
+
+  # traccar.xml, шаблоны и файлы tracksms подключены томами: compose не видит их изменений и не пересоздаёт
+  # контейнер, а том-файл после замены продолжает указывать на старую версию — нужен перезапуск
+  - name: Restart traccar after config change
+    command: docker compose restart traccar
+    args:
+      chdir: "{{ dir_compose }}"
+    when:
+      - traccar_xml.changed or traccar_templates.changed
+      - up.stderr is not search('traccar\\s+(Recreate|Created)')
+
+  - name: Restart tracksms after config change
+    command: docker compose restart tracksms
+    args:
+      chdir: "{{ dir_compose }}"
+    when:
+      - tracksms_conf.changed
+      - up.stderr is not search('tracksms\\s+(Recreate|Created)')
+
+  - name: Wait for Traccar on this node
+    include_tasks: tasks/traccar-healthcheck.yaml
+
+  # ------------------------------------------------------------------ очистка
+  # только неиспользуемые образы; тома, сети и остановленные контейнеры других сервисов не трогаем
+  - name: Remove unused images
+    command: docker image prune -a -f
+    changed_when: false

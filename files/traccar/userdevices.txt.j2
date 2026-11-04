@@ -1,0 +1,5 @@
+[
+{% for d in tracksms_devices %}
+    {"devid": {{ d.devid | string | to_json }}, "userphone": {{ d.userphone | string | to_json }}, "chatid": {{ d.chatid | string | to_json }}}{{ "," if not loop.last else "" }}
+{% endfor %}
+]

@@ -1,0 +1,99 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE properties SYSTEM 'http://java.sun.com/dtd/properties.dtd'>
+<!--
+    Сгенерировано Ansible из files/traccar/traccar.xml.j2. Не редактируйте на сервере.
+    Секреты здесь не хранятся: они приходят из переменных окружения (traccar.env, 0600),
+    имя переменной — ключ в верхнем регистре с подчёркиваниями: database.password → DATABASE_PASSWORD.
+    Все параметры: https://www.traccar.org/configuration-file/
+-->
+<properties>
+
+    <!-- Порты. С 6.17 записываются в базу при первом запуске; позже меняются в разделе протоколов. -->
+    <entry key='web.port'>{{ traccar_web_port }}</entry>
+    <entry key='osmand.port'>{{ traccar_osmand_port }}</entry>
+{% for name, port in traccar_protocol_ports.items() %}
+    <entry key='{{ name }}.port'>{{ port }}</entry>
+{% endfor %}
+    <entry key='web.url'>{{ traccar_web_url | e }}</entry>
+    <!-- Все запросы к веб приходят от двух адресов reverse proxy: обычный лимит резал бы всех сразу. -->
+    <entry key='web.maxRequestsPerSec'>999</entry>
+
+    <!-- База. Пароль — DATABASE_PASSWORD. -->
+    <entry key='database.driver'>com.mysql.cj.jdbc.Driver</entry>
+    <entry key='database.url'>jdbc:mysql://{{ traccar_db_host }}:{{ traccar_db_port }}/{{ traccar_db_name }}?allowPublicKeyRetrieval=true&amp;useSSL=false&amp;serverTimezone=UTC&amp;allowMultiQueries=true&amp;autoReconnect=true&amp;useUnicode=yes&amp;characterEncoding=UTF-8&amp;sessionVariables=sql_mode=''</entry>
+    <entry key='database.user'>{{ traccar_db_user | e }}</entry>
+
+    <!-- Два узла: синхронизация через Redis; регламентные задачи — только на узле 1. -->
+    <entry key='broadcast.type'>redis</entry>
+    <entry key='broadcast.address'>{{ traccar_broadcast_redis | e }}</entry>
+{% if node | int != 1 %}
+    <entry key='broadcast.secondary'>true</entry>
+{% endif %}
+
+    <!-- Адреса (LocationIQ, совместим с nominatim). Ключ — GEOCODER_KEY. -->
+    <entry key='geocoder.enable'>true</entry>
+    <entry key='geocoder.type'>nominatim</entry>
+    <entry key='geocoder.url'>{{ traccar_geocoder_url | e }}</entry>
+    <entry key='geocoder.reuseDistance'>60</entry>
+    <entry key='geocoder.language'>ru</entry>
+    <entry key='geocoder.cacheSize'>600000</entry>
+    <entry key='geocoder.onRequest'>{{ traccar_geocoder_on_request | bool | lower }}</entry>
+    <entry key='geocoder.ignorePositions'>{{ traccar_geocoder_ignore_positions | bool | lower }}</entry>
+
+    <!-- Местоположение по вышкам и Wi-Fi (Google). Ключ — GEOLOCATION_KEY. -->
+    <entry key='geolocation.enable'>true</entry>
+    <entry key='geolocation.type'>google</entry>
+    <entry key='geolocation.reuse'>true</entry>
+    <entry key='geolocation.processInvalidPositions'>true</entry>
+
+    <!-- Уведомления. Ключи — NOTIFICATOR_TRACCAR_KEY, NOTIFICATOR_TELEGRAM_KEY, MAIL_SMTP_PASSWORD. -->
+    <entry key='notificator.types'>web,mail,traccar,sms,telegram</entry>
+    <entry key='notificator.telegram.chatId'>{{ telegram_chat_id }}</entry>
+    <entry key='notificator.telegram.sendLocation'>true</entry>
+
+    <entry key='mail.smtp.host'>{{ traccar_smtp_host | e }}</entry>
+    <entry key='mail.smtp.port'>{{ traccar_smtp_port }}</entry>
+    <entry key='mail.smtp.ssl.enable'>true</entry>
+    <entry key='mail.smtp.from'>{{ traccar_smtp_from | e }}</entry>
+    <entry key='mail.smtp.auth'>true</entry>
+    <entry key='mail.smtp.username'>{{ traccar_smtp_user | e }}</entry>
+
+    <!-- «SMS» через tracksms: сообщения уходят в Telegram-чаты по устройствам. -->
+    <entry key='notificator.sms.manager.class'>org.traccar.sms.HttpSmsClient</entry>
+    <entry key='sms.http.url'>http://tracksms:{{ tracksms_port }}</entry>
+    <entry key='sms.http.template'>userphone={phone}&amp;text={message}</entry>
+
+    <!-- Обработка -->
+    <entry key='event.motion.processInvalidPositions'>true</entry>
+    <entry key='processing.computedAttributes.enable'>true</entry>
+    <entry key='processing.computedAttributes.deviceAttributes'>true</entry>
+    <entry key='processing.engineHours.enable'>true</entry>
+    <!-- Выключено намеренно: реальный IP телефона дописывает reverse proxy (атрибут ip), иначе здесь был бы его адрес. -->
+    <entry key='processing.remoteAddress.enable'>false</entry>
+
+    <entry key='speedLimit.enable'>true</entry>
+    <entry key='speedLimit.type'>overpass</entry>
+    <entry key='speedLimit.url'>{{ traccar_speedlimit_url | e }}</entry>
+    <entry key='speedLimit.accuracy'>100</entry>
+
+    <!-- Устройства и пользователи -->
+    <entry key='status.timeout'>{{ traccar_status_timeout }}</entry>
+    <entry key='database.ignoreUnknown'>false</entry>
+    <entry key='database.registerUnknown'>{{ traccar_register_unknown | bool | lower }}</entry>
+    <entry key='database.registerUnknown.defaultCategory'>Default</entry>
+    <entry key='database.registerUnknown.defaultGroupId'>{{ traccar_register_unknown_group_id }}</entry>
+    <entry key='database.registerUnknown.regex'>{{ traccar_register_unknown_regex | e }}</entry>
+    <entry key='web.showUnknownDevices'>true</entry>
+    <entry key='users.defaultExpirationDays'>{{ traccar_user_expiration_days }}</entry>
+    <entry key='users.defaultDeviceLimit'>{{ traccar_user_device_limit }}</entry>
+
+    <!-- Вход только через Keycloak. Секрет клиента — OPENID_CLIENT_SECRET. -->
+    <entry key='openid.force'>true</entry>
+    <entry key='openid.clientId'>{{ traccar_openid_client_id | e }}</entry>
+    <entry key='openid.authUrl'>{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/auth</entry>
+    <entry key='openid.tokenUrl'>{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token</entry>
+    <entry key='openid.userInfoUrl'>{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/userinfo</entry>
+    <entry key='openid.allowGroup'>{{ traccar_openid_allow_group | e }}</entry>
+    <entry key='openid.adminGroup'>{{ traccar_openid_admin_group | e }}</entry>
+
+</properties>

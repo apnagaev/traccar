@@ -1,0 +1,42 @@
+# Сгенерировано Ansible. Применять: nft -f /etc/nftables.d/{{ service }}.nft
+# НЕ делайте systemctl restart/reload nftables: /etc/nftables.conf начинается с flush ruleset и снесёт правила Docker.
+#
+# Docker публикует порты через DNAT в prerouting (priority -100). Поэтому фильтруем раньше, priority -150,
+# пока виден настоящий порт назначения и адрес клиента.
+#
+# Закрыты снаружи: веб/API, приём OsmAnd и tracksms. OsmAnd — обязательно: реальный IP телефона в атрибут ip
+# дописывает reverse proxy, и прямой доступ к порту позволил бы подставить любой адрес.
+# Порты протоколов трекеров не трогаем — они открыты всем.
+
+table inet {{ service }}
+delete table inet {{ service }}
+
+table inet {{ service }} {
+  set trusted {
+    type ipv4_addr
+    flags interval
+    auto-merge
+    elements = { {{ (trusted_nets + cluster_nodes) | join(', ') }} }
+  }
+
+  set ports {
+    type inet_service
+    elements = { {{ [traccar_web_port, traccar_osmand_port, tracksms_port] | join(', ') }} }
+  }
+
+  chain prerouting {
+    type filter hook prerouting priority -150; policy accept;
+
+    # проверки самого хоста (плейбук, curl 127.0.0.1)
+    iifname "lo" accept
+
+    # reverse proxy в контейнере на этом же хосте приходит из Docker-сетей
+    tcp dport @ports ip saddr 172.16.0.0/12 accept
+
+    # узлы кластера, reverse proxy, мониторинг, внутренняя сеть
+    tcp dport @ports ip saddr @trusted accept
+
+    # всем остальным, включая IPv6
+    tcp dport @ports drop
+  }
+}

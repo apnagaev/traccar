@@ -1,0 +1,24 @@
+## Изменено: короткий текст (SMS через tracksms, Telegram, push) — прежний, с #deviceid<id> для tracksms.
+#set($subject = "$esc.html($device.name): водитель изменился")
+#if($driver)
+#set($driverName = $driver.name)
+#else
+#set($driverName = $event.getString('driverUniqueId'))
+#end
+#define($digestText)
+Водитель #$driverName #заменен в #deviceid$device.id $device.name в $dateTool.format("yyyy-MM-dd HH:mm:ss", $event.eventTime, $locale, $timezone)
+Точка замены: $!position.address
+https://yandex.ru/maps/?text=$position.latitude%2C$position.longitude
+#end
+#set($digest = $digestText.toString().trim())
+<!DOCTYPE html>
+<html>
+<body>
+Устройство: $esc.html($device.name)<br>
+Время: $dateTool.format('dd.MM.yyyy HH:mm:ss', $event.eventTime, $locale, $timezone)<br>
+Координаты: <a href="$webUrl/event/$event.id">#{if}($position.address)$esc.html($position.address)#{else}$position.latitude&deg;, $position.longitude&deg;#{end}</a><br>
+Водитель: $esc.html($driverName)<br>
+<br>
+<a href="$webUrl/settings/notifications?token=$token">Отписаться</a>
+</body>
+</html>
