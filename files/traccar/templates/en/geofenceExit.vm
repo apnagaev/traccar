@@ -1,0 +1,19 @@
+## Изменено: короткий текст (SMS через tracksms, Telegram, push) — прежний, с #deviceid<id> для tracksms.
+#set($subject = "$esc.html($device.name): has exited geofence")
+#define($digestText)
+#deviceid$device.id $device.name has exited geofence $geofence.name at $dateTool.format("yyyy-MM-dd HH:mm:ss", $event.eventTime, $locale, $timezone)
+Point: $!position.address
+https://yandex.ru/maps/?text=$position.latitude%2C$position.longitude
+#end
+#set($digest = $digestText.toString().trim())
+<!DOCTYPE html>
+<html>
+<body>
+Device: $esc.html($device.name)<br>
+Has exited geofence: $esc.html($geofence.name)<br>
+Time: $dateTool.format('yyyy-MM-dd HH:mm:ss', $event.eventTime, $locale, $timezone)<br>
+Point: <a href="$webUrl/event/$event.id">#{if}($position.address)$esc.html($position.address)#{else}$position.latitude&deg;, $position.longitude&deg;#{end}</a><br>
+<br>
+<a href="$webUrl/settings/notifications?token=$token">Unsubscribe</a>
+</body>
+</html>

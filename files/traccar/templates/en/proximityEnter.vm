@@ -1,0 +1,16 @@
+## Изменено: короткий текст (SMS через tracksms, Telegram, push) — прежний, с #deviceid<id> для tracksms.
+#set($subject = "$esc.html($device.name): has entered proximity")
+#set($digest = "$device.name has entered linked device proximity at $dateTool.format('yyyy-MM-dd HH:mm:ss', $event.eventTime, $locale, $timezone)")
+#set($deviceTag = '#deviceid')
+#set($digest = "$deviceTag$device.id $digest")
+<!DOCTYPE html>
+<html>
+<body>
+Device: $esc.html($device.name)<br>
+Has entered linked device proximity<br>
+Time: $dateTool.format('yyyy-MM-dd HH:mm:ss', $event.eventTime, $locale, $timezone)<br>
+Point: <a href="$webUrl/event/$event.id">#{if}($position.address)$esc.html($position.address)#{else}$position.latitude&deg;, $position.longitude&deg;#{end}</a><br>
+<br>
+<a href="$webUrl/settings/notifications?token=$token">Unsubscribe</a>
+</body>
+</html>

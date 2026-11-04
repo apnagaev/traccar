@@ -1,0 +1,4 @@
+inventory.yml
+vars/traccar.yml
+*.vault
+*.retry

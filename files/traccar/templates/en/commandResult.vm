@@ -1,0 +1,19 @@
+## Изменено: короткий текст (SMS через tracksms, Telegram, push) — прежний, с #deviceid<id> для tracksms.
+#set($subject = "$esc.html($device.name): command result received")
+#define($digestText)
+#deviceid$device.id $device.name command result received: $position.getString("result") at $dateTool.format("yyyy-MM-dd HH:mm:ss", $event.eventTime, $locale, $timezone)
+Event:
+$webUrl/event/$event.id
+#end
+#set($digest = $digestText.toString().trim())
+<!DOCTYPE html>
+<html>
+<body>
+Device: $esc.html($device.name)<br>
+Result: $esc.html($position.getString('result'))<br>
+Time: $dateTool.format('yyyy-MM-dd HH:mm:ss', $event.eventTime, $locale, $timezone)<br>
+Link: <a href="$webUrl/event/$event.id">$webUrl/event/$event.id</a><br>
+<br>
+<a href="$webUrl/settings/notifications?token=$token">Unsubscribe</a>
+</body>
+</html>

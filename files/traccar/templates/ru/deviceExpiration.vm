@@ -1,0 +1,11 @@
+## Изменено: короткий текст (SMS через tracksms, Telegram, push) — прежний, с #deviceid<id> для tracksms.
+#set($subject = "Истечение срока действия устройства")
+#set($digest = "Срок действия устройства $device.name истёк")
+#set($deviceTag = '#deviceid')
+#set($digest = "$deviceTag$device.id $digest")
+<!DOCTYPE html>
+<html>
+<body>
+Срок действия вашего устройства $esc.html($device.name) истёк.
+</body>
+</html>

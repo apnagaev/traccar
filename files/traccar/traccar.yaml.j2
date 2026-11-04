@@ -1,0 +1,64 @@
+# Сгенерировано Ansible из files/traccar/traccar.yaml.j2. Не редактируйте на сервере.
+# Секреты — в traccar.env рядом (0600), настройки — в traccar.xml.
+
+name: traccar
+
+x-logging: &logging
+  driver: local                    # журналы контейнеров с ротацией
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  traccar:
+    image: traccar/traccar:{{ traccar_version }}
+    container_name: traccar
+    hostname: {{ traccar_hostname }}
+    restart: unless-stopped
+    dns: [{{ dns_server }}]
+    env_file: [traccar.env]
+    networks: [traccar]
+    logging: *logging
+    ports:
+      - {{ traccar_web_port }}:{{ traccar_web_port }}        # веб и API — для reverse proxy (firewall)
+      - {{ traccar_osmand_port }}:{{ traccar_osmand_port }}  # телефоны — только через reverse proxy (firewall)
+{% for p in traccar_published_ports %}
+{% if p.proto in ['tcp', 'both'] %}
+      - {{ p.host }}:{{ p.container }}
+{% endif %}
+{% if p.proto in ['udp', 'both'] %}
+      - {{ p.host }}:{{ p.container }}/udp
+{% endif %}
+{% endfor %}
+    volumes:
+      - ./traccar.xml:/opt/traccar/conf/traccar.xml:ro
+      - {{ traccar_logs_dir }}:/opt/traccar/logs              # журналы вне контейнера, чистятся по сроку
+      - {{ traccar_media_dir }}:/opt/traccar/media            # фото и аудио от устройств
+      # свои шаблоны уведомлений: короткий текст с #deviceid<id> для tracksms (остальные — штатные)
+{% for t in notification_templates %}
+      - ./notifications/{{ t | dirname | basename }}/{{ t | basename }}:/opt/traccar/templates/notifications/{{ t | dirname | basename }}/{{ t | basename }}:ro
+{% endfor %}
+
+  tracksms:
+    image: tracksms
+    build:
+      context: {{ tracksms_build_dir }}
+    container_name: tracksms
+    restart: unless-stopped
+    dns: [{{ dns_server }}]
+    environment:
+      TZ: "{{ traccar_tz }}"
+    networks: [traccar]
+    logging: *logging
+    ports:
+      - {{ tracksms_port }}:{{ tracksms_port }}               # только внутренняя сеть (firewall)
+    volumes:
+      - ./userdevices.txt:/httpserver/userdevices.txt:ro
+      - ./smsconf.txt:/httpserver/smsconf.txt:ro
+
+networks:
+  traccar:
+    ipam:
+      driver: default
+      config:
+        - subnet: {{ traccar_subnet }}
