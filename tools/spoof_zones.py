@@ -83,7 +83,7 @@ def jumps(points, v_jump, min_jump):
     for a, b in zip(points, points[1:]):
         d = km(a["lat"], a["lon"], b["lat"], b["lon"])
         h = (b["t"] - a["t"]) / 3600
-        if d > min_jump and (h <= 0 or d / h > v_jump):
+        if d > min_jump and h > 0 and d / h > v_jump:
             out.append(b)
     return out
 
@@ -149,12 +149,13 @@ def replay(points, zones, v_any, v_zone, min_jump):
         if last is not None and p.get("valid", True):
             d = km(last["lat"], last["lon"], p["lat"], p["lon"])
             h = (p["t"] - last["t"]) / 3600
-            v = d / h if h > 0 else (1e9 if d > min_jump else 0)
+            # точка не новее прошлой (буфер трекера, одинаковое время) — сравнивать не с чем, оставляем как есть
+            v = d / h if h > 0 else 0
             # в зоне: прыжок в неё или продолжение подмены — но только пока точка далеко от замороженного места
             if d > min_jump:
                 if v > v_any:
-                    spoofed = "скорость" if h > 0 else "время назад"
-                elif in_zone(zones, p["lat"], p["lon"]):
+                    spoofed = "скорость"
+                elif in_zone(zones, p["lat"], p["lon"]) and h > 0:
                     spoofed = "удержание в зоне" if last["spoofed"] else ("вход в зону" if v > v_zone else False)
         cur = dict(p, spoofed=bool(spoofed))
         if spoofed:
@@ -208,9 +209,10 @@ def jexl(zones, v_any, v_zone, min_jump):
     zone = " || ".join(
         f"math:hypot(110.57 * (latitude - {z['lat']}), {111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}"
         for z in zones) or "false"
-    speed = f"({hours} <= 0 || {dist} / {hours} > {{v}})"
+    speed = f"{dist} / {hours} > {{v}}"
     # точки без GPS (valid = false) не трогаем: их координаты потом считает геолокация по вышкам
-    spoofed = (f"(lastLatitude ?? null) == null || !valid ? false : ({dist} > {min_jump} && ("
+    # точку не новее прошлой (буфер трекера) не трогаем: прошлая — более поздняя, сравнение бессмысленно
+    spoofed = (f"(lastLatitude ?? null) == null || !valid || {hours} <= 0 ? false : ({dist} > {min_jump} && ("
                f"{speed.format(v=v_any)} || (({zone}) && ((lastSpoofed ?? false) || {speed.format(v=v_zone)}))))")
     return [
         # описание, атрибут, тип, приоритет (отрицательный — до фильтров), выражение
@@ -270,8 +272,6 @@ def main():
                 near = sorted({h["dev"] for h in homes if km(z["lat"], z["lon"], h["lat"], h["lon"]) < z["radius_km"] + 0.5})
                 if near:
                     z["excluded"] = "место стоянки: " + ", ".join(near)
-                elif z.get("moving", 1) < 0.5:
-                    z["excluded"] = f"точки неподвижны ({int((1 - z['moving']) * 100)} %)"
             return zs
 
         zones = make_zones(jp)
