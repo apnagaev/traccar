@@ -31,6 +31,9 @@ import urllib.request
 # ---------------------------------------------------------------- параметры правила (по умолчанию)
 V_ANY = 350.0      # км/ч: быстрее не ездит никто — прыжок в любом месте
 V_ZONE = 150.0     # км/ч: прыжок в известную зону подмены
+V_STILL = 100.0    # км/ч: прыжок, а трекер говорит, что стоит (скорость ниже STILL_KMH) — подмена
+STILL_KMH = 5.0    # км/ч: скорость от трекера, ниже которой он «стоит»
+V_STILL_ZONE = 30.0  # км/ч: то же для прыжка в зону подмены (короткие прыжки при редких точках на стоянке)
 MIN_JUMP = 1.0     # км: короче — шум GPS при малом интервале, а не прыжок
 TAG = "antispoof"  # префикс описаний атрибутов в Traccar
 
@@ -141,7 +144,7 @@ def in_zone(zones, lat, lon):
     return any(km(z["lat"], z["lon"], lat, lon) < z["radius_km"] for z in zones)
 
 
-def replay(points, zones, v_any, v_zone, min_jump):
+def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL):
     """Прогон истории устройства через правило. last — последняя сохранённая (возможно, замороженная) точка."""
     last, frozen = None, []
     for p in points:
@@ -155,8 +158,12 @@ def replay(points, zones, v_any, v_zone, min_jump):
             if d > min_jump:
                 if v > v_any:
                     spoofed = "скорость"
+                elif h > 0 and v > v_still and p.get("speed", 0) < STILL_KMH:
+                    spoofed = "прыжок стоя"
                 elif in_zone(zones, p["lat"], p["lon"]) and h > 0:
-                    spoofed = "удержание в зоне" if last["spoofed"] else ("вход в зону" if v > v_zone else False)
+                    still = p.get("speed", 0) < STILL_KMH
+                    spoofed = "удержание в зоне" if last["spoofed"] else (
+                        "вход в зону" if v > v_zone or (still and v > V_STILL_ZONE) else False)
         cur = dict(p, spoofed=bool(spoofed))
         if spoofed:
             cur["lat"], cur["lon"] = last["lat"], last["lon"]
@@ -202,7 +209,7 @@ L.control.layers(null,over,{collapsed:false}).addTo(m);
 
 
 # ---------------------------------------------------------------- выражения для Traccar (JEXL)
-def jexl(zones, v_any, v_zone, min_jump):
+def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
     dist = ("math:hypot(110.57 * (latitude - lastLatitude), "
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
     hours = "((fixTime.getTime() - lastFixTime.getTime()) / 3600000.0)"
@@ -213,7 +220,7 @@ def jexl(zones, v_any, v_zone, min_jump):
     # точки без GPS (valid = false) не трогаем: их координаты потом считает геолокация по вышкам
     # точку не новее прошлой (буфер трекера) не трогаем: прошлая — более поздняя, сравнение бессмысленно
     spoofed = (f"(lastLatitude ?? null) == null || !valid || {hours} <= 0 ? false : ({dist} > {min_jump} && ("
-               f"{speed.format(v=v_any)} || (({zone}) && ((lastSpoofed ?? false) || {speed.format(v=v_zone)}))))")
+               f"{speed.format(v=v_any)} || (speed < {STILL_KMH / 1.852:.2f} && {speed.format(v=v_still)}) || (({zone}) && ((lastSpoofed ?? false) || {speed.format(v=v_zone)} || (speed < {STILL_KMH / 1.852:.2f} && {speed.format(v=V_STILL_ZONE)})))))")
     return [
         # описание, атрибут, тип, приоритет (отрицательный — до фильтров), выражение
         (f"{TAG}: подмена GPS", "spoofed", "boolean", -1, spoofed),
@@ -221,6 +228,36 @@ def jexl(zones, v_any, v_zone, min_jump):
         (f"{TAG}: долгота", "longitude", "number", -3, "(spoofed ?? false) ? lastLongitude : longitude"),
         (f"{TAG}: скорость", "speed", "number", -4, "(spoofed ?? false) ? 0 : speed"),
     ]
+
+
+def diagnose(api, name, hours, zones, v_any, v_zone):
+    """Разбор одного устройства: каждая точка за последние часы — интервал, расстояние, скорость прыжка,
+    скорость и зажигание от трекера, зона, атрибут spoofed в базе и почему правило сработало или нет."""
+    dev = next((d for d in api.call("GET", "/devices") if d["name"] == name), None)
+    if dev is None:
+        sys.exit(f"устройство {name!r} не найдено")
+    now = dt.datetime.now(dt.timezone.utc)
+    pts = sorted(api.positions(dev["id"], now - dt.timedelta(hours=hours), now), key=lambda p: p["fixTime"])
+    attrs_seen = {}
+    for p in pts:
+        for k in (p.get("attributes") or {}):
+            attrs_seen[k] = attrs_seen.get(k, 0) + 1
+    print(f"{name}: {len(pts)} точек за {hours} ч. Атрибуты: " + ", ".join(f"{k} {v}" for k, v in sorted(attrs_seen.items())))
+    print("время (UTC)          интервал   км    км/ч   скор зажиг движ  valid  зона  spoofed  координаты")
+    prev = None
+    for p in pts:
+        at = p.get("attributes") or {}
+        t = parse_time(p["fixTime"])
+        line = dict(gap="", d="", v="")
+        if prev:
+            d = km(prev["latitude"], prev["longitude"], p["latitude"], p["longitude"])
+            h = (t - parse_time(prev["fixTime"])) / 3600
+            line = dict(gap=f"{h * 60:6.1f}м", d=f"{d:6.2f}", v=f"{d / h:6.0f}" if h > 0 else "   —  ")
+        z = next((i + 1 for i, zz in enumerate(zones) if km(zz["lat"], zz["lon"], p["latitude"], p["longitude"]) < zz["radius_km"]), "")
+        print(f"{p['fixTime'][:19]}  {line['gap']:>8} {line['d']:>6} {line['v']:>6}  {(p.get('speed') or 0) * 1.852:5.0f} "
+              f"{str(at.get('ignition', '—')):>5} {str(at.get('motion', '—')):>5} {str(p.get('valid')):>6} {str(z):>4}  "
+              f"{str(at.get('spoofed', '—')):>7}  {p['latitude']:.5f},{p['longitude']:.5f}")
+        prev = p
 
 
 def main():
@@ -233,16 +270,24 @@ def main():
     ap.add_argument("--min-episodes", type=int, default=10, help="меньше прыжков в зону — случайность, а не зона")
     ap.add_argument("--exclude", action="append", default=[], metavar="LAT,LON",
                     help="убрать зону, в которую попадает точка (можно несколько раз)")
+    ap.add_argument("--include", action="append", default=[], metavar="LAT,LON",
+                    help="применять зону, даже если она исключена (например, стоянка другого устройства)")
     ap.add_argument("--save-history", help="сохранить скачанную историю в файл JSON")
     ap.add_argument("--history", help="взять историю из файла (без запросов к истории в Traccar)")
     ap.add_argument("--map", help="записать HTML-карту: зоны и замороженные/оставленные точки")
+    ap.add_argument("--diagnose", metavar="УСТРОЙСТВО", help="построчный разбор точек устройства (с --hours и --zones)")
+    ap.add_argument("--hours", type=int, default=24, help="для --diagnose: сколько часов смотреть")
     ap.add_argument("--v-any", type=float, default=V_ANY)
     ap.add_argument("--v-zone", type=float, default=V_ZONE)
+    ap.add_argument("--v-still", type=float, default=V_STILL)
     ap.add_argument("--apply", action="store_true", help="создать или обновить вычисляемые атрибуты в Traccar")
     ap.add_argument("--group-id", type=int, help="привязать атрибуты к группе устройств")
     a = ap.parse_args()
 
     api = Api(a.url, a.token)
+    if a.diagnose:
+        zones = [z for z in json.load(open(a.zones, encoding="utf-8")) if not z.get("excluded")] if a.zones else []
+        return diagnose(api, a.diagnose, a.hours, zones, a.v_any, a.v_zone)
     now = dt.datetime.now(dt.timezone.utc)
     history = {}
     devices = [] if a.history else api.call("GET", "/devices")
@@ -275,6 +320,11 @@ def main():
             return zs
 
         zones = make_zones(jp)
+    for inc in a.include:
+        la, lo = (float(x) for x in inc.split(","))
+        for z in zones:
+            if km(z["lat"], z["lon"], la, lo) < z["radius_km"]:
+                z.pop("excluded", None)
     for ex in a.exclude:
         la, lo = (float(x) for x in ex.split(","))
         for z in zones:
@@ -296,7 +346,7 @@ def main():
     print("\nПроверка правила на истории (сколько точек заморозилось бы, по причинам):")
     frozen_all = {}
     for name, pts in history.items():
-        fr = replay(pts, zones, a.v_any, a.v_zone, MIN_JUMP)
+        fr = replay(pts, zones, a.v_any, a.v_zone, MIN_JUMP, a.v_still)
         frozen_all[name] = fr
         if pts:
             reasons = {}
@@ -308,7 +358,7 @@ def main():
         write_map(a.map, history, frozen_all, all_zones)
         print(f"\nКарта: {a.map}", file=sys.stderr)
 
-    attrs = jexl(zones, a.v_any, a.v_zone, MIN_JUMP)
+    attrs = jexl(zones, a.v_any, a.v_zone, MIN_JUMP, a.v_still)
     print("\nВычисляемые атрибуты (Настройки → Атрибуты; порядок важен — приоритет):")
     for desc, attr, typ, prio, expr in attrs:
         print(f"\n# {desc}  [атрибут {attr}, тип {typ}, приоритет {prio}]\n{expr}")
