@@ -34,6 +34,7 @@ V_ZONE = 150.0     # км/ч: прыжок в известную зону под
 V_STILL = 100.0    # км/ч: прыжок, а трекер говорит, что стоит (скорость ниже STILL_KMH) — подмена
 STILL_KMH = 5.0    # км/ч: скорость от трекера, ниже которой он «стоит»
 V_STILL_ZONE = 30.0  # км/ч: то же для прыжка в зону подмены (короткие прыжки при редких точках на стоянке)
+ANCHOR_MOVE_KM = 0.05  # км: точка без GPS, но сдвинулась дальше — настоящая (сотовая сеть, OBD), сдвигает время
 MIN_JUMP = 1.0     # км: короче — шум GPS при малом интервале, а не прыжок
 TAG = "antispoof"  # префикс описаний атрибутов в Traccar
 
@@ -145,30 +146,39 @@ def in_zone(zones, lat, lon):
 
 
 def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL):
-    """Прогон истории устройства через правило. last — последняя сохранённая (возможно, замороженная) точка."""
+    """Прогон истории устройства через правило — так же, как его выполняет Traccar.
+    last — последняя точка, которую Traccar считает текущей (её обновляют только точки не старше её);
+    anchor — время последней настоящей точки: замороженные и повторы координат без GPS его не сдвигают."""
     last, frozen = None, []
     for p in points:
         spoofed = False
-        if last is not None and p.get("valid", True):
+        if last is not None:
             d = km(last["lat"], last["lon"], p["lat"], p["lon"])
-            h = (p["t"] - last["t"]) / 3600
-            # точка не новее прошлой (буфер трекера, одинаковое время) — сравнивать не с чем, оставляем как есть
-            v = d / h if h > 0 else 0
-            # в зоне: прыжок в неё или продолжение подмены — но только пока точка далеко от замороженного места
-            if d > min_jump:
-                if v > v_any:
+            zone = in_zone(zones, p["lat"], p["lon"])
+            if p["t"] < last["t"]:
+                # точка из буфера трекера старше текущей: сравнивать скорость не с чем, режем только зоны
+                spoofed = "зона (буфер)" if zone and d > min_jump else False
+            elif d > min_jump:
+                h = (p["t"] - last["anchor"]) / 3600
+                still = p.get("speed", 0) < STILL_KMH
+                if d > v_any * h:
                     spoofed = "скорость"
-                elif h > 0 and v > v_still and p.get("speed", 0) < STILL_KMH:
+                elif still and d > v_still * h:
                     spoofed = "прыжок стоя"
-                elif in_zone(zones, p["lat"], p["lon"]) and h > 0:
-                    still = p.get("speed", 0) < STILL_KMH
+                elif zone:
                     spoofed = "удержание в зоне" if last["spoofed"] else (
-                        "вход в зону" if v > v_zone or (still and v > V_STILL_ZONE) else False)
+                        "вход в зону" if d > v_zone * h or (still and d > V_STILL_ZONE * h) else False)
         cur = dict(p, spoofed=bool(spoofed))
         if spoofed:
             cur["lat"], cur["lon"] = last["lat"], last["lon"]
+            cur["anchor"] = last["anchor"]
             frozen.append(dict(p, reason=spoofed))
-        last = cur
+        elif last is None or p.get("valid", True) or km(last["lat"], last["lon"], p["lat"], p["lon"]) > ANCHOR_MOVE_KM:
+            cur["anchor"] = p["t"]
+        else:
+            cur["anchor"] = last["anchor"]          # без GPS на том же месте (тоннель, парковка): время не сдвигаем
+        if last is None or p["t"] >= last["t"]:
+            last = cur
     return frozen
 
 
@@ -212,21 +222,31 @@ L.control.layers(null,over,{collapsed:false}).addTo(m);
 def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
     dist = ("math:hypot(110.57 * (latitude - lastLatitude), "
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
-    hours = "((fixTime.getTime() - lastFixTime.getTime()) / 3600000.0)"
+    # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается.
+    # Иначе после тоннеля или после одной замороженной точки все следующие настоящие казались бы прыжками
+    # (далеко от замороженного места за секунды) и замерзали цепочкой, пока машина не вернётся.
+    anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
+    hours = f"((fixTime.getTime() - {anchor}) / 3600000.0)"
     zone = " || ".join(
         f"math:hypot(110.57 * (latitude - {z['lat']}), {111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}"
         for z in zones) or "false"
-    speed = f"{dist} / {hours} > {{v}}"
-    # точки без GPS (valid = false) не трогаем: их координаты потом считает геолокация по вышкам
-    # точку не новее прошлой (буфер трекера) не трогаем: прошлая — более поздняя, сравнение бессмысленно
-    spoofed = (f"(lastLatitude ?? null) == null || !valid || {hours} <= 0 ? false : ({dist} > {min_jump} && ("
-               f"{speed.format(v=v_any)} || (speed < {STILL_KMH / 1.852:.2f} && {speed.format(v=v_still)}) || (({zone}) && ((lastSpoofed ?? false) || {speed.format(v=v_zone)} || (speed < {STILL_KMH / 1.852:.2f} && {speed.format(v=V_STILL_ZONE)})))))")
+    faster = lambda v: f"{dist} > {v} * {hours}"          # без деления: интервал может быть нулевым
+    # скорость от трекера; у трекеров с OBD (obdSpeed, км/ч) speed бывает всегда 0
+    still = f"math:max(speed, (obdSpeed ?? 0) / 1.852) < {STILL_KMH / 1.852:.2f}"
+    older = "fixTime.getTime() < lastFixTime.getTime()"
+    # точки без GPS (valid = false) проверяются так же: при подмене трекер часто ставит valid = false,
+    # а координаты всё равно подменённые
+    spoofed = (f"(lastLatitude ?? null) == null ? false : ({older} ? (({zone}) && {dist} > {min_jump}) : ({dist} > {min_jump} && ("
+               f"{faster(v_any)} || ({still} && {faster(v_still)}) || (({zone}) && ((lastSpoofed ?? false) || {faster(v_zone)} || ({still} && {faster(V_STILL_ZONE)}))))))")
+    fix_anchor = (f"(spoofed ?? false) ? {anchor} : ((lastLatitude ?? null) == null || valid || {dist} > {ANCHOR_MOVE_KM}"
+                  f" ? fixTime.getTime() : (lastFixAnchor ?? fixTime.getTime()))")
     return [
-        # описание, атрибут, тип, приоритет (отрицательный — до фильтров), выражение
+        # описание, атрибут, тип, приоритет (отрицательный — до фильтров; больше — раньше), выражение
         (f"{TAG}: подмена GPS", "spoofed", "boolean", -1, spoofed),
         (f"{TAG}: широта", "latitude", "number", -2, "(spoofed ?? false) ? lastLatitude : latitude"),
         (f"{TAG}: долгота", "longitude", "number", -3, "(spoofed ?? false) ? lastLongitude : longitude"),
         (f"{TAG}: скорость", "speed", "number", -4, "(spoofed ?? false) ? 0 : speed"),
+        (f"{TAG}: время настоящей точки", "fixAnchor", "number", -5, fix_anchor),
     ]
 
 
