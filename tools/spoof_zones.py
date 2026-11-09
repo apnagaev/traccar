@@ -145,22 +145,35 @@ def in_zone(zones, lat, lon):
     return any(km(z["lat"], z["lon"], lat, lon) < z["radius_km"] for z in zones)
 
 
+def moving(p):
+    """Может ли машина ехать: зажигание, датчик движения, обороты или скорость по OBD. Нет данных — может."""
+    if p.get("ign") is None and p.get("motion") is None and p.get("obd") is None and p.get("rpm") is None:
+        return True
+    return bool(p.get("ign")) or bool(p.get("motion")) or (p.get("obd") or 0) > 0 or (p.get("rpm") or 0) > 0
+
+
 def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL):
     """Прогон истории устройства через правило — так же, как его выполняет Traccar.
     last — последняя точка, которую Traccar считает текущей (её обновляют только точки не старше её);
-    anchor — время последней настоящей точки: замороженные и повторы координат без GPS его не сдвигают."""
+    anchor — время последней настоящей точки: замороженные и повторы координат без GPS его не сдвигают;
+    idle — сколько из этого времени машина точно стояла (зажигание выключено, движения нет): за это время
+    она никуда уехать не могла, и долгая подмена на стоянке не «отлипает» со временем."""
     last, frozen = None, []
     for p in points:
         spoofed = False
+        idle_add = 0
         if last is not None:
             d = km(last["lat"], last["lon"], p["lat"], p["lon"])
             zone = in_zone(zones, p["lat"], p["lon"])
+            chain = last["anchor"] != last["t"]          # прошлая точка заморожена или без GPS на старом месте
+            if not moving(p) and not moving(last) and p["t"] > last["t"]:
+                idle_add = p["t"] - last["t"]
             if p["t"] < last["t"]:
                 # точка из буфера трекера старше текущей: сравнивать скорость не с чем, режем только зоны
                 spoofed = "зона (буфер)" if zone and d > min_jump else False
             elif d > min_jump:
-                h = (p["t"] - last["anchor"]) / 3600
-                still = p.get("speed", 0) < STILL_KMH
+                h = (p["t"] - last["anchor"] - ((last["idle"] + idle_add) if chain else 0)) / 3600
+                still = max(p.get("speed", 0), p.get("obd") or 0) < STILL_KMH or last["spoofed"]
                 if d > v_any * h:
                     spoofed = "скорость"
                 elif still and d > v_still * h:
@@ -177,6 +190,10 @@ def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL):
             cur["anchor"] = p["t"]
         else:
             cur["anchor"] = last["anchor"]          # без GPS на том же месте (тоннель, парковка): время не сдвигаем
+        if cur["anchor"] == p["t"]:
+            cur["idle"] = 0
+        else:
+            cur["idle"] = (last["idle"] if last["anchor"] != last["t"] else 0) + idle_add
         if last is None or p["t"] >= last["t"]:
             last = cur
     return frozen
@@ -226,13 +243,27 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
     # Иначе после тоннеля или после одной замороженной точки все следующие настоящие казались бы прыжками
     # (далеко от замороженного места за секунды) и замерзали цепочкой, пока машина не вернётся.
     anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
-    hours = f"((fixTime.getTime() - {anchor}) / 3600000.0)"
+    # прошлая точка заморожена или без GPS на старом месте — идёт «цепочка» от последней настоящей точки
+    chain = f"({anchor} != lastFixTime.getTime())"
+    # может ли машина ехать: зажигание, датчик движения, обороты, скорость OBD; нет таких данных — может
+    def mv(pre):
+        n = lambda a: pre + a[0].upper() + a[1:] if pre else a     # lastIgnition, lastObdSpeed…
+        ig, mo, ob, rp = n("ignition"), n("motion"), n("obdSpeed"), n("rpm")
+        return (f"(({ig} ?? null) == null && ({mo} ?? null) == null && ({ob} ?? null) == null && ({rp} ?? null) == null"
+                f" ? true : (({ig} ?? false) ? true : (({mo} ?? false) ? true : (({ob} ?? 0) > 0 || ({rp} ?? 0) > 0))))")
+    moving, last_moving = mv(""), mv("last")
+    # время стоянки на этом интервале: машина с выключенным зажиганием и без движения никуда не уедет,
+    # поэтому долгая подмена на стоянке со временем не «отлипает»
+    idle_add = f"(({moving}) || ({last_moving}) ? 0 : (fixTime.getTime() - lastFixTime.getTime()))"
+    idle = f"(({chain}) ? ((lastIdleMs ?? 0) + {idle_add}) : 0)"
+    hours = f"((fixTime.getTime() - {anchor} - {idle}) / 3600000.0)"
     zone = " || ".join(
         f"math:hypot(110.57 * (latitude - {z['lat']}), {111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}"
         for z in zones) or "false"
     faster = lambda v: f"{dist} > {v} * {hours}"          # без деления: интервал может быть нулевым
-    # скорость от трекера; у трекеров с OBD (obdSpeed, км/ч) speed бывает всегда 0
-    still = f"math:max(speed, (obdSpeed ?? 0) / 1.852) < {STILL_KMH / 1.852:.2f}"
+    # «стоит»: скорость от трекера и OBD (obdSpeed, км/ч) ниже порога; во время подмены скорость тоже подменная,
+    # поэтому выход из заморозки проверяется по скорости «стоя»
+    still = f"(math:max(speed, (obdSpeed ?? 0) / 1.852) < {STILL_KMH / 1.852:.2f} || (lastSpoofed ?? false))"
     older = "fixTime.getTime() < lastFixTime.getTime()"
     # точки без GPS (valid = false) проверяются так же: при подмене трекер часто ставит valid = false,
     # а координаты всё равно подменённые
@@ -240,6 +271,8 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
                f"{faster(v_any)} || ({still} && {faster(v_still)}) || (({zone}) && ((lastSpoofed ?? false) || {faster(v_zone)} || ({still} && {faster(V_STILL_ZONE)}))))))")
     fix_anchor = (f"(spoofed ?? false) ? {anchor} : ((lastLatitude ?? null) == null || valid || {dist} > {ANCHOR_MOVE_KM}"
                   f" ? fixTime.getTime() : (lastFixAnchor ?? fixTime.getTime()))")
+    idle_ms = (f"(lastLatitude ?? null) == null || (fixAnchor ?? 0) == fixTime.getTime() ? 0 : "
+               f"((({chain}) ? (lastIdleMs ?? 0) : 0) + {idle_add})")
     return [
         # описание, атрибут, тип, приоритет (отрицательный — до фильтров; больше — раньше), выражение
         (f"{TAG}: подмена GPS", "spoofed", "boolean", -1, spoofed),
@@ -247,6 +280,7 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
         (f"{TAG}: долгота", "longitude", "number", -3, "(spoofed ?? false) ? lastLongitude : longitude"),
         (f"{TAG}: скорость", "speed", "number", -4, "(spoofed ?? false) ? 0 : speed"),
         (f"{TAG}: время настоящей точки", "fixAnchor", "number", -5, fix_anchor),
+        (f"{TAG}: время стоянки", "idleMs", "number", -6, idle_ms),
     ]
 
 
@@ -316,7 +350,9 @@ def main():
     for d in devices:
         pts = api.positions(d["id"], now - dt.timedelta(days=a.days), now)
         pts = [{"dev": d["name"], "t": parse_time(p["fixTime"]), "lat": p["latitude"], "lon": p["longitude"],
-                "speed": (p.get("speed") or 0) * 1.852, "valid": p.get("valid", True)}
+                "speed": (p.get("speed") or 0) * 1.852, "valid": p.get("valid", True),
+                **{k: (p.get("attributes") or {}).get(a) for k, a in (("ign", "ignition"), ("motion", "motion"),
+                                                                      ("obd", "obdSpeed"), ("rpm", "rpm"))}}
                for p in pts if p.get("latitude") or p.get("longitude")]
         history[d["name"]] = sorted(pts, key=lambda p: p["t"])
         print(f"{d['name']}: {len(pts)} точек", file=sys.stderr)
