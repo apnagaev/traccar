@@ -26,6 +26,7 @@ import json
 import math
 import sys
 import urllib.parse
+import urllib.error
 import urllib.request
 
 # ---------------------------------------------------------------- параметры правила (по умолчанию)
@@ -62,9 +63,13 @@ class Api:
         req.add_header("Accept", "application/json")
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=300) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else None
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:500]
+            sys.exit(f"Traccar: {method} {path} → HTTP {e.code}: {detail}")
 
     def positions(self, device_id, t_from, t_to):
         """История по суткам, чтобы не упираться в лимит ответа сервера."""
@@ -243,58 +248,64 @@ L.control.layers(null,over,{collapsed:false}).addTo(m);
 
 
 # ---------------------------------------------------------------- выражения для Traccar (JEXL)
+MAX_EXPR = 4000      # tc_attributes.expression — VARCHAR(4000)
+
+
 def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
-    dist = ("math:hypot(110.57 * (latitude - lastLatitude), "
+    """Вычисляемые атрибуты. Выражение в Traccar — не длиннее 4000 символов, поэтому общие части
+    (расстояние, время, зоны, «может ехать») считаются отдельными атрибутами раньше и дальше
+    используются по имени: контекст каждого атрибута видит уже посчитанные."""
+    circle = lambda z: (f"math:hypot(110.57 * (latitude - {z['lat']}), "
+                        f"{111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}")
+    dist = ("(lastLatitude ?? null) == null ? 0 : math:hypot(110.57 * (latitude - lastLatitude), "
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
-    # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается.
-    # Иначе после тоннеля или после одной замороженной точки все следующие настоящие казались бы прыжками
-    # (далеко от замороженного места за секунды) и замерзали цепочкой, пока машина не вернётся.
-    anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
-    # прошлая точка заморожена или без GPS на старом месте — идёт «цепочка» от последней настоящей точки
-    chain = f"({anchor} != lastFixTime.getTime())"
-    # может ли машина ехать: зажигание, датчик движения, обороты, скорость OBD; нет зажигания, OBD и оборотов
+    # может ли машина ехать: зажигание, датчик движения, обороты, скорость OBD. Нет зажигания, OBD и оборотов
     # (телефоны, походные трекеры: motion у них Traccar считает по скорости GPS) — может
-    def mv(pre):
-        n = lambda a: pre + a[0].upper() + a[1:] if pre else a     # lastIgnition, lastObdSpeed…
-        ig, mo, ob, rp = n("ignition"), n("motion"), n("obdSpeed"), n("rpm")
-        return (f"(({ig} ?? null) == null && ({ob} ?? null) == null && ({rp} ?? null) == null"
-                f" ? true : (({ig} ?? false) ? true : (({mo} ?? false) ? true : (({ob} ?? 0) > 0 || ({rp} ?? 0) > 0))))")
-    moving, last_moving = mv(""), mv("last")
-    # время стоянки на этом интервале: машина с выключенным зажиганием и без движения никуда не уедет,
-    # поэтому долгая подмена на стоянке со временем не «отлипает»
-    idle_add = f"(({moving}) || ({last_moving}) ? 0 : (fixTime.getTime() - lastFixTime.getTime()))"
-    idle = f"(({chain}) ? ((lastIdleMs ?? 0) + {idle_add}) : 0)"
-    hours = f"((fixTime.getTime() - {anchor} - {idle}) / 3600000.0)"
-    zone = " || ".join(
-        f"math:hypot(110.57 * (latitude - {z['lat']}), {111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}"
-        for z in zones) or "false"
-    faster = lambda v: f"{dist} > {v} * {hours}"          # без деления: интервал может быть нулевым
-    # «стоит»: скорость от трекера и OBD (obdSpeed, км/ч) ниже порога; во время подмены скорость тоже подменная,
-    # поэтому, если датчик движения говорит «стоим», выход из заморозки проверяется по скорости «стоя».
-    # Только по lastSpoofed нельзя: после одной замороженной точки вся поездка по трассе быстрее 100 км/ч замерзала
+    moving = ("(ignition ?? null) == null && (obdSpeed ?? null) == null && (rpm ?? null) == null ? true : "
+              "((ignition ?? false) ? true : ((motion ?? false) ? true : ((obdSpeed ?? 0) > 0 || (rpm ?? 0) > 0)))")
+    # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается
+    anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
+    chain = f"{anchor} != lastFixTime.getTime()"      # прошлая заморожена или без GPS на старом месте
+    # интервал, когда машина точно стояла (обе точки без признаков движения): за него она не уедет
+    idle_add = "(spoofMoving || (lastSpoofMoving ?? true) ? 0 : fixTime.getTime() - lastFixTime.getTime())"
+    hours = (f"(lastFixTime ?? null) == null ? 0 : (fixTime.getTime() - {anchor} - "
+             f"(({chain}) ? (lastIdleMs ?? 0) + {idle_add} : 0)) / 3600000.0")
+    zone = " || ".join(circle(z) for z in zones) or "false"
+    home = " || ".join(circle(z) for z in parking) or "false"
+    # «стоит»: скорость от трекера и OBD ниже порога; во время подмены скорость тоже подменная, поэтому,
+    # если датчик движения говорит «стоим», выход из заморозки проверяется по скорости «стоя».
+    # Только по lastSpoofed нельзя: после одной замороженной точки замерзала вся поездка по трассе
     still = f"(math:max(speed, (obdSpeed ?? 0) / 1.852) < {STILL_KMH / 1.852:.2f} || ((lastSpoofed ?? false) && !(motion ?? true)))"
-    older = "fixTime.getTime() < lastFixTime.getTime()"
-    # точки без GPS (valid = false) проверяются так же: при подмене трекер часто ставит valid = false,
-    # а координаты всё равно подменённые
-    home = " || ".join(
-        f"math:hypot(110.57 * (latitude - {z['lat']}), {111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}"
-        for z in parking) or "false"
-    # возврат на место стоянки — всегда настоящая точка (подмена туда не уводит)
-    spoofed = (f"(lastLatitude ?? null) == null || ({home}) ? false : ({older} ? (({zone}) && {dist} > {min_jump}) : ({dist} > {min_jump} && ("
-               f"{faster(v_any)} || ({still} && {faster(v_still)}) || (({zone}) && ((lastSpoofed ?? false) || {faster(v_zone)} || ({still} && {faster(V_STILL_ZONE)}))))))")
-    fix_anchor = (f"(spoofed ?? false) ? {anchor} : ((lastLatitude ?? null) == null || valid || {dist} > {ANCHOR_MOVE_KM}"
+    faster = lambda v: f"spoofDist > {v} * spoofHours"      # без деления: интервал может быть нулевым
+    # возврат на место стоянки — всегда настоящая точка (подмена туда не уводит); точка старше текущей
+    # (буфер трекера) — только «в зоне и далеко»; точки без GPS (valid = false) проверяются так же
+    spoofed = (f"(lastLatitude ?? null) == null || spoofHome ? false : "
+               f"(fixTime.getTime() < lastFixTime.getTime() ? (spoofZone && spoofDist > {min_jump}) : "
+               f"(spoofDist > {min_jump} && ({faster(v_any)} || ({still} && {faster(v_still)}) || "
+               f"(spoofZone && ((lastSpoofed ?? false) || {faster(v_zone)} || ({still} && {faster(V_STILL_ZONE)}))))))")
+    fix_anchor = (f"(spoofed ?? false) ? {anchor} : ((lastLatitude ?? null) == null || valid || spoofDist > {ANCHOR_MOVE_KM}"
                   f" ? fixTime.getTime() : (lastFixAnchor ?? fixTime.getTime()))")
     idle_ms = (f"(lastLatitude ?? null) == null || (fixAnchor ?? 0) == fixTime.getTime() ? 0 : "
                f"((({chain}) ? (lastIdleMs ?? 0) : 0) + {idle_add})")
-    return [
+    attrs = [
         # описание, атрибут, тип, приоритет (отрицательный — до фильтров; больше — раньше), выражение
-        (f"{TAG}: подмена GPS", "spoofed", "boolean", -1, spoofed),
-        (f"{TAG}: широта", "latitude", "number", -2, "(spoofed ?? false) ? lastLatitude : latitude"),
-        (f"{TAG}: долгота", "longitude", "number", -3, "(spoofed ?? false) ? lastLongitude : longitude"),
-        (f"{TAG}: скорость", "speed", "number", -4, "(spoofed ?? false) ? 0 : speed"),
-        (f"{TAG}: время настоящей точки", "fixAnchor", "number", -5, fix_anchor),
-        (f"{TAG}: время стоянки", "idleMs", "number", -6, idle_ms),
+        (f"{TAG}: может ехать", "spoofMoving", "boolean", -1, moving),
+        (f"{TAG}: расстояние от прошлой", "spoofDist", "number", -2, dist),
+        (f"{TAG}: время от настоящей точки", "spoofHours", "number", -3, hours),
+        (f"{TAG}: в зоне подмены", "spoofZone", "boolean", -4, zone),
+        (f"{TAG}: на месте стоянки", "spoofHome", "boolean", -5, home),
+        (f"{TAG}: подмена GPS", "spoofed", "boolean", -6, spoofed),
+        (f"{TAG}: широта", "latitude", "number", -7, "(spoofed ?? false) ? lastLatitude : latitude"),
+        (f"{TAG}: долгота", "longitude", "number", -8, "(spoofed ?? false) ? lastLongitude : longitude"),
+        (f"{TAG}: скорость", "speed", "number", -9, "(spoofed ?? false) ? 0 : speed"),
+        (f"{TAG}: время настоящей точки", "fixAnchor", "number", -10, fix_anchor),
+        (f"{TAG}: время стоянки", "idleMs", "number", -11, idle_ms),
     ]
+    for desc, attr, typ, prio, expr in attrs:
+        if len(expr) > MAX_EXPR:
+            sys.exit(f"выражение «{desc}» длиннее {MAX_EXPR} символов ({len(expr)}): Traccar его не сохранит. "
+                     f"Уменьшите число зон (--exclude) или объедините близкие.")
+    return attrs
 
 
 def diagnose(api, name, hours, zones, v_any, v_zone):
