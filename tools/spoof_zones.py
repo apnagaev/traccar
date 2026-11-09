@@ -146,13 +146,14 @@ def in_zone(zones, lat, lon):
 
 
 def moving(p):
-    """Может ли машина ехать: зажигание, датчик движения, обороты или скорость по OBD. Нет данных — может."""
-    if p.get("ign") is None and p.get("motion") is None and p.get("obd") is None and p.get("rpm") is None:
+    """Может ли машина ехать: зажигание, датчик движения, обороты или скорость по OBD.
+    Без зажигания, OBD и оборотов (телефоны, походные трекеры) — может: motion у них Traccar считает по скорости GPS."""
+    if p.get("ign") is None and p.get("obd") is None and p.get("rpm") is None:
         return True
     return bool(p.get("ign")) or bool(p.get("motion")) or (p.get("obd") or 0) > 0 or (p.get("rpm") or 0) > 0
 
 
-def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL):
+def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
     """Прогон истории устройства через правило — так же, как его выполняет Traccar.
     last — последняя точка, которую Traccar считает текущей (её обновляют только точки не старше её);
     anchor — время последней настоящей точки: замороженные и повторы координат без GPS его не сдвигают;
@@ -168,12 +169,18 @@ def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL):
             chain = last["anchor"] != last["t"]          # прошлая точка заморожена или без GPS на старом месте
             if not moving(p) and not moving(last) and p["t"] > last["t"]:
                 idle_add = p["t"] - last["t"]
-            if p["t"] < last["t"]:
+            if parking and in_zone(parking, p["lat"], p["lon"]):
+                # возврат на место стоянки — настоящая точка: подмена туда не уводит. Иначе после «протёкшей»
+                # подменной точки машина залипала бы на ней, пока стоит дома с выключенным зажиганием
+                spoofed = False
+            elif p["t"] < last["t"]:
                 # точка из буфера трекера старше текущей: сравнивать скорость не с чем, режем только зоны
                 spoofed = "зона (буфер)" if zone and d > min_jump else False
             elif d > min_jump:
                 h = (p["t"] - last["anchor"] - ((last["idle"] + idle_add) if chain else 0)) / 3600
-                still = max(p.get("speed", 0), p.get("obd") or 0) < STILL_KMH or last["spoofed"]
+                # во время подмены скорость от трекера тоже подменная: если датчик движения говорит «стоим»,
+                # выход из заморозки проверяется по порогу «стоя»
+                still = max(p.get("speed", 0), p.get("obd") or 0) < STILL_KMH or (last["spoofed"] and p.get("motion") is False)
                 if d > v_any * h:
                     spoofed = "скорость"
                 elif still and d > v_still * h:
@@ -236,7 +243,7 @@ L.control.layers(null,over,{collapsed:false}).addTo(m);
 
 
 # ---------------------------------------------------------------- выражения для Traccar (JEXL)
-def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
+def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
     dist = ("math:hypot(110.57 * (latitude - lastLatitude), "
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
     # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается.
@@ -245,11 +252,12 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
     anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
     # прошлая точка заморожена или без GPS на старом месте — идёт «цепочка» от последней настоящей точки
     chain = f"({anchor} != lastFixTime.getTime())"
-    # может ли машина ехать: зажигание, датчик движения, обороты, скорость OBD; нет таких данных — может
+    # может ли машина ехать: зажигание, датчик движения, обороты, скорость OBD; нет зажигания, OBD и оборотов
+    # (телефоны, походные трекеры: motion у них Traccar считает по скорости GPS) — может
     def mv(pre):
         n = lambda a: pre + a[0].upper() + a[1:] if pre else a     # lastIgnition, lastObdSpeed…
         ig, mo, ob, rp = n("ignition"), n("motion"), n("obdSpeed"), n("rpm")
-        return (f"(({ig} ?? null) == null && ({mo} ?? null) == null && ({ob} ?? null) == null && ({rp} ?? null) == null"
+        return (f"(({ig} ?? null) == null && ({ob} ?? null) == null && ({rp} ?? null) == null"
                 f" ? true : (({ig} ?? false) ? true : (({mo} ?? false) ? true : (({ob} ?? 0) > 0 || ({rp} ?? 0) > 0))))")
     moving, last_moving = mv(""), mv("last")
     # время стоянки на этом интервале: машина с выключенным зажиганием и без движения никуда не уедет,
@@ -262,12 +270,17 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL):
         for z in zones) or "false"
     faster = lambda v: f"{dist} > {v} * {hours}"          # без деления: интервал может быть нулевым
     # «стоит»: скорость от трекера и OBD (obdSpeed, км/ч) ниже порога; во время подмены скорость тоже подменная,
-    # поэтому выход из заморозки проверяется по скорости «стоя»
-    still = f"(math:max(speed, (obdSpeed ?? 0) / 1.852) < {STILL_KMH / 1.852:.2f} || (lastSpoofed ?? false))"
+    # поэтому, если датчик движения говорит «стоим», выход из заморозки проверяется по скорости «стоя».
+    # Только по lastSpoofed нельзя: после одной замороженной точки вся поездка по трассе быстрее 100 км/ч замерзала
+    still = f"(math:max(speed, (obdSpeed ?? 0) / 1.852) < {STILL_KMH / 1.852:.2f} || ((lastSpoofed ?? false) && !(motion ?? true)))"
     older = "fixTime.getTime() < lastFixTime.getTime()"
     # точки без GPS (valid = false) проверяются так же: при подмене трекер часто ставит valid = false,
     # а координаты всё равно подменённые
-    spoofed = (f"(lastLatitude ?? null) == null ? false : ({older} ? (({zone}) && {dist} > {min_jump}) : ({dist} > {min_jump} && ("
+    home = " || ".join(
+        f"math:hypot(110.57 * (latitude - {z['lat']}), {111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}"
+        for z in parking) or "false"
+    # возврат на место стоянки — всегда настоящая точка (подмена туда не уводит)
+    spoofed = (f"(lastLatitude ?? null) == null || ({home}) ? false : ({older} ? (({zone}) && {dist} > {min_jump}) : ({dist} > {min_jump} && ("
                f"{faster(v_any)} || ({still} && {faster(v_still)}) || (({zone}) && ((lastSpoofed ?? false) || {faster(v_zone)} || ({still} && {faster(V_STILL_ZONE)}))))))")
     fix_anchor = (f"(spoofed ?? false) ? {anchor} : ((lastLatitude ?? null) == null || valid || {dist} > {ANCHOR_MOVE_KM}"
                   f" ? fixTime.getTime() : (lastFixAnchor ?? fixTime.getTime()))")
@@ -391,9 +404,11 @@ def main():
     for z in zones:
         print(f"  {'—' if z.get('excluded') else '+'} {z['lat']:.5f}, {z['lon']:.5f}  r={z['radius_km']} км"
               + (f"  прыжков {z['episodes']}, устройств {z['devices']}, в движении {int(z['moving'] * 100)} %"
-                 if "points" in z else "")
+                 if "episodes" in z else "")
+              + (f"  {z['note']}" if z.get("note") else "")
               + (f"  ИСКЛЮЧЕНА: {z['excluded']}" if z.get("excluded") else ""))
     all_zones, zones = zones, [z for z in zones if not z.get("excluded")]
+    parking = [z for z in all_zones if str(z.get("excluded", "")).startswith("место стоянки")]
     if a.apply and not zones:
         sys.exit("нет зон для применения")
     if a.save:
@@ -402,7 +417,7 @@ def main():
     print("\nПроверка правила на истории (сколько точек заморозилось бы, по причинам):")
     frozen_all = {}
     for name, pts in history.items():
-        fr = replay(pts, zones, a.v_any, a.v_zone, MIN_JUMP, a.v_still)
+        fr = replay(pts, zones, a.v_any, a.v_zone, MIN_JUMP, a.v_still, parking)
         frozen_all[name] = fr
         if pts:
             reasons = {}
@@ -414,7 +429,7 @@ def main():
         write_map(a.map, history, frozen_all, all_zones)
         print(f"\nКарта: {a.map}", file=sys.stderr)
 
-    attrs = jexl(zones, a.v_any, a.v_zone, MIN_JUMP, a.v_still)
+    attrs = jexl(zones, a.v_any, a.v_zone, MIN_JUMP, a.v_still, parking)
     print("\nВычисляемые атрибуты (Настройки → Атрибуты; порядок важен — приоритет):")
     for desc, attr, typ, prio, expr in attrs:
         print(f"\n# {desc}  [атрибут {attr}, тип {typ}, приоритет {prio}]\n{expr}")
