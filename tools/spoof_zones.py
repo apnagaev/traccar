@@ -37,7 +37,10 @@ STILL_KMH = 5.0    # км/ч: скорость от трекера, ниже к�
 V_STILL_ZONE = 30.0  # км/ч: то же для прыжка в зону подмены (короткие прыжки при редких точках на стоянке)
 ANCHOR_MOVE_KM = 0.05  # км: точка без GPS, но сдвинулась дальше — настоящая (сотовая сеть, OBD), сдвигает время
 MIN_JUMP = 1.0     # км: короче — шум GPS при малом интервале, а не прыжок
-PARKED_ATTR = "autostart"  # атрибут: мотор работает, но машина стоит (автозапуск) — --parked-attr
+# «Мотор работает, но машина стоит» (автозапуск) — --parked: имя (атрибут истинный: 1, true)
+# или имя=значение (строка). locked — машина заперта (Pandora: заперта — значит, только автозапуск),
+# astart=Ra — работает автозапуск, astart=T — автозапуск включил зажигание, мотор ещё не заведён.
+PARKED = "locked,astart=Ra,astart=T"
 TAG = "antispoof"  # префикс описаний атрибутов в Traccar
 
 
@@ -153,14 +156,27 @@ def in_zone(zones, lat, lon):
     return any(km(z["lat"], z["lon"], lat, lon) < z["radius_km"] for z in zones)
 
 
+def _truthy(v):
+    return str(v) in ("1", "1.0", "true", "True")
+
+
+def parked(p):
+    """Мотор может работать, но машина стоит: признаки из PARKED (автозапуск, машина заперта)."""
+    at = p.get("attrs") or {}
+    for item in filter(None, PARKED.split(",")):
+        name, _, value = item.partition("=")
+        v = at.get(name)
+        if v is not None and ((str(v) == value) if value else _truthy(v)):
+            return True
+    return False
+
+
 def moving(p):
-    """Может ли машина ехать: включено зажигание и это не автозапуск (атрибут PARKED_ATTR: autostart или,
-    например, locked у Pandora — при автозапуске охрана остаётся включённой).
-    Датчику движения и скорости OBD не верим: у этих трекеров они ненадёжны. Без зажигания
-    (телефоны, походные трекеры) — может."""
+    """Может ли машина ехать: зажигание включено и нет признака автозапуска (PARKED).
+    Датчику движения и скорости OBD не верим. Без зажигания (телефоны, походные трекеры) — может."""
     if p.get("ign") is None:
         return True
-    return bool(p.get("ign")) and not bool((p.get("attrs") or {}).get(PARKED_ATTR, p.get("auto")))
+    return _truthy(p.get("ign")) and not parked(p)
 
 
 def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
@@ -266,7 +282,14 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
     # может ли машина ехать: зажигание включено и это не автозапуск (autostart). Датчику движения и OBD не верим.
     # Нет зажигания (телефоны, походные трекеры) — может
-    moving = f"(ignition ?? null) == null ? true : ((ignition ?? false) ? (({PARKED_ATTR} ?? false) ? false : true) : false)"
+    # строки сравниваем как строки ('' + x): у JEXL '0' == true и 'Ra' == true
+    truthy = lambda n: f"('' + {n} == '1' || '' + {n} == '1.0' || '' + {n} == 'true')"
+    conds = []
+    for item in filter(None, PARKED.split(",")):
+        name, _, value = item.partition("=")
+        conds.append(f"('' + ({name} ?? '')) == '{value}'" if value else f"(({name} ?? null) != null && {truthy(name)})")
+    parked_expr = " || ".join(conds) or "false"
+    moving = f"(ignition ?? null) == null ? true : ({truthy('ignition')} ? (({parked_expr}) ? false : true) : false)"
     # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается
     anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
     chain = f"{anchor} != lastFixTime.getTime()"      # прошлая заморожена или без GPS на старом месте
@@ -344,7 +367,7 @@ def diagnose(api, name, hours, zones, v_any, v_zone, extra=()):
 
 
 def main():
-    global PARKED_ATTR
+    global PARKED
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True)
     ap.add_argument("--token", required=True)
@@ -362,15 +385,16 @@ def main():
     ap.add_argument("--diagnose", metavar="УСТРОЙСТВО", help="построчный разбор точек устройства (с --hours и --zones)")
     ap.add_argument("--hours", type=int, default=24, help="для --diagnose: сколько часов смотреть")
     ap.add_argument("--attrs", default="", help="для --diagnose: доп. атрибуты в колонках, через запятую (rpm,locked)")
-    ap.add_argument("--parked-attr", default=PARKED_ATTR,
-                    help="атрибут «мотор работает, но машина стоит» (автозапуск): autostart, locked…")
+    ap.add_argument("--parked", default=PARKED,
+                    help="признаки «мотор работает, но машина стоит» (автозапуск), через запятую: имя (истинно) "
+                         "или имя=значение. По умолчанию: " + PARKED)
     ap.add_argument("--v-any", type=float, default=V_ANY)
     ap.add_argument("--v-zone", type=float, default=V_ZONE)
     ap.add_argument("--v-still", type=float, default=V_STILL)
     ap.add_argument("--apply", action="store_true", help="создать или обновить вычисляемые атрибуты в Traccar")
     ap.add_argument("--group-id", type=int, help="привязать атрибуты к группе устройств")
     a = ap.parse_args()
-    PARKED_ATTR = a.parked_attr
+    PARKED = a.parked
 
     api = Api(a.url, a.token)
     if a.diagnose:
@@ -388,7 +412,7 @@ def main():
                 **{k: (p.get("attributes") or {}).get(a) for k, a in (("ign", "ignition"), ("motion", "motion"),
                                                                       ("obd", "obdSpeed"), ("rpm", "rpm"))},
                 "attrs": {k: v for k, v in (p.get("attributes") or {}).items()
-                          if k in ("autostart", "locked", "rpm", "alarm", "armed", "blocked")}}
+                          if k in {item.partition("=")[0] for item in PARKED.split(",")} | {"autostart", "locked", "astart", "rpm"}}}
                for p in pts if p.get("latitude") or p.get("longitude")]
         history[d["name"]] = sorted(pts, key=lambda p: p["t"])
         print(f"{d['name']}: {len(pts)} точек", file=sys.stderr)
