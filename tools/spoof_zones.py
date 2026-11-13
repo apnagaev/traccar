@@ -153,14 +153,12 @@ def in_zone(zones, lat, lon):
 
 
 def moving(p):
-    """Может ли машина ехать. Есть OBD — по скорости OBD; иначе нужны и зажигание, и датчик движения
-    (автозапуск ночью: зажигание есть, а машина стоит; вибрация мотора иногда включает motion на минуту).
-    Без зажигания, OBD и оборотов (телефоны, походные трекеры: motion у них Traccar считает по скорости GPS) — может."""
-    if p.get("ign") is None and p.get("obd") is None and p.get("rpm") is None:
+    """Может ли машина ехать: включено зажигание и это не автозапуск (атрибут autostart, например у Pandora).
+    Датчику движения и скорости OBD не верим: у этих трекеров они ненадёжны. Без зажигания
+    (телефоны, походные трекеры) — может."""
+    if p.get("ign") is None:
         return True
-    if p.get("obd") is not None:
-        return (p.get("obd") or 0) > 0
-    return bool(p.get("ign")) and bool(p.get("motion"))
+    return bool(p.get("ign")) and not bool(p.get("auto"))
 
 
 def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
@@ -264,10 +262,9 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
                         f"{111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}")
     dist = ("(lastLatitude ?? null) == null ? 0 : math:hypot(110.57 * (latitude - lastLatitude), "
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
-    # может ли машина ехать: есть OBD — скорость OBD > 0; иначе зажигание И датчик движения (автозапуск ночью
-    # даёт зажигание без движения). Нет зажигания, OBD и оборотов (телефоны, походные трекеры) — может
-    moving = ("(ignition ?? null) == null && (obdSpeed ?? null) == null && (rpm ?? null) == null ? true : "
-              "((obdSpeed ?? null) != null ? obdSpeed > 0 : ((ignition ?? false) ? ((motion ?? false) ? true : false) : false))")
+    # может ли машина ехать: зажигание включено и это не автозапуск (autostart). Датчику движения и OBD не верим.
+    # Нет зажигания (телефоны, походные трекеры) — может
+    moving = "(ignition ?? null) == null ? true : ((ignition ?? false) ? ((autostart ?? false) ? false : true) : false)"
     # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается
     anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
     chain = f"{anchor} != lastFixTime.getTime()"      # прошлая заморожена или без GPS на старом месте
@@ -381,7 +378,8 @@ def main():
         pts = [{"dev": d["name"], "t": parse_time(p["fixTime"]), "lat": p["latitude"], "lon": p["longitude"],
                 "speed": (p.get("speed") or 0) * 1.852, "valid": p.get("valid", True),
                 **{k: (p.get("attributes") or {}).get(a) for k, a in (("ign", "ignition"), ("motion", "motion"),
-                                                                      ("obd", "obdSpeed"), ("rpm", "rpm"))}}
+                                                                      ("obd", "obdSpeed"), ("rpm", "rpm"),
+                                                                      ("auto", "autostart"))}}
                for p in pts if p.get("latitude") or p.get("longitude")]
         history[d["name"]] = sorted(pts, key=lambda p: p["t"])
         print(f"{d['name']}: {len(pts)} точек", file=sys.stderr)
