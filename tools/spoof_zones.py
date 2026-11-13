@@ -37,6 +37,7 @@ STILL_KMH = 5.0    # км/ч: скорость от трекера, ниже к�
 V_STILL_ZONE = 30.0  # км/ч: то же для прыжка в зону подмены (короткие прыжки при редких точках на стоянке)
 ANCHOR_MOVE_KM = 0.05  # км: точка без GPS, но сдвинулась дальше — настоящая (сотовая сеть, OBD), сдвигает время
 MIN_JUMP = 1.0     # км: короче — шум GPS при малом интервале, а не прыжок
+PARKED_ATTR = "autostart"  # атрибут: мотор работает, но машина стоит (автозапуск) — --parked-attr
 TAG = "antispoof"  # префикс описаний атрибутов в Traccar
 
 
@@ -153,12 +154,13 @@ def in_zone(zones, lat, lon):
 
 
 def moving(p):
-    """Может ли машина ехать: включено зажигание и это не автозапуск (атрибут autostart, например у Pandora).
+    """Может ли машина ехать: включено зажигание и это не автозапуск (атрибут PARKED_ATTR: autostart или,
+    например, locked у Pandora — при автозапуске охрана остаётся включённой).
     Датчику движения и скорости OBD не верим: у этих трекеров они ненадёжны. Без зажигания
     (телефоны, походные трекеры) — может."""
     if p.get("ign") is None:
         return True
-    return bool(p.get("ign")) and not bool(p.get("auto"))
+    return bool(p.get("ign")) and not bool((p.get("attrs") or {}).get(PARKED_ATTR, p.get("auto")))
 
 
 def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
@@ -264,7 +266,7 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
     # может ли машина ехать: зажигание включено и это не автозапуск (autostart). Датчику движения и OBD не верим.
     # Нет зажигания (телефоны, походные трекеры) — может
-    moving = "(ignition ?? null) == null ? true : ((ignition ?? false) ? ((autostart ?? false) ? false : true) : false)"
+    moving = f"(ignition ?? null) == null ? true : ((ignition ?? false) ? (({PARKED_ATTR} ?? false) ? false : true) : false)"
     # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается
     anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
     chain = f"{anchor} != lastFixTime.getTime()"      # прошлая заморожена или без GPS на старом месте
@@ -310,7 +312,7 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
     return attrs
 
 
-def diagnose(api, name, hours, zones, v_any, v_zone):
+def diagnose(api, name, hours, zones, v_any, v_zone, extra=()):
     """Разбор одного устройства: каждая точка за последние часы — интервал, расстояние, скорость прыжка,
     скорость и зажигание от трекера, зона, атрибут spoofed в базе и почему правило сработало или нет."""
     dev = next((d for d in api.call("GET", "/devices") if d["name"] == name), None)
@@ -323,7 +325,7 @@ def diagnose(api, name, hours, zones, v_any, v_zone):
         for k in (p.get("attributes") or {}):
             attrs_seen[k] = attrs_seen.get(k, 0) + 1
     print(f"{name}: {len(pts)} точек за {hours} ч. Атрибуты: " + ", ".join(f"{k} {v}" for k, v in sorted(attrs_seen.items())))
-    print("время (UTC)          интервал   км    км/ч   скор зажиг движ  valid  зона  spoofed  координаты")
+    print("время (UTC)          интервал   км    км/ч   скор зажиг движ  valid  зона  spoofed  координаты" + "".join(f"  {x}" for x in extra))
     prev = None
     for p in pts:
         at = p.get("attributes") or {}
@@ -336,11 +338,13 @@ def diagnose(api, name, hours, zones, v_any, v_zone):
         z = next((i + 1 for i, zz in enumerate(zones) if km(zz["lat"], zz["lon"], p["latitude"], p["longitude"]) < zz["radius_km"]), "")
         print(f"{p['fixTime'][:19]}  {line['gap']:>8} {line['d']:>6} {line['v']:>6}  {(p.get('speed') or 0) * 1.852:5.0f} "
               f"{str(at.get('ignition', '—')):>5} {str(at.get('motion', '—')):>5} {str(p.get('valid')):>6} {str(z):>4}  "
-              f"{str(at.get('spoofed', '—')):>7}  {p['latitude']:.5f},{p['longitude']:.5f}")
+              f"{str(at.get('spoofed', '—')):>7}  {p['latitude']:.5f},{p['longitude']:.5f}"
+              + "".join(f"  {str(at.get(x, '—'))}" for x in extra))
         prev = p
 
 
 def main():
+    global PARKED_ATTR
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True)
     ap.add_argument("--token", required=True)
@@ -357,17 +361,21 @@ def main():
     ap.add_argument("--map", help="записать HTML-карту: зоны и замороженные/оставленные точки")
     ap.add_argument("--diagnose", metavar="УСТРОЙСТВО", help="построчный разбор точек устройства (с --hours и --zones)")
     ap.add_argument("--hours", type=int, default=24, help="для --diagnose: сколько часов смотреть")
+    ap.add_argument("--attrs", default="", help="для --diagnose: доп. атрибуты в колонках, через запятую (rpm,locked)")
+    ap.add_argument("--parked-attr", default=PARKED_ATTR,
+                    help="атрибут «мотор работает, но машина стоит» (автозапуск): autostart, locked…")
     ap.add_argument("--v-any", type=float, default=V_ANY)
     ap.add_argument("--v-zone", type=float, default=V_ZONE)
     ap.add_argument("--v-still", type=float, default=V_STILL)
     ap.add_argument("--apply", action="store_true", help="создать или обновить вычисляемые атрибуты в Traccar")
     ap.add_argument("--group-id", type=int, help="привязать атрибуты к группе устройств")
     a = ap.parse_args()
+    PARKED_ATTR = a.parked_attr
 
     api = Api(a.url, a.token)
     if a.diagnose:
         zones = [z for z in json.load(open(a.zones, encoding="utf-8")) if not z.get("excluded")] if a.zones else []
-        return diagnose(api, a.diagnose, a.hours, zones, a.v_any, a.v_zone)
+        return diagnose(api, a.diagnose, a.hours, zones, a.v_any, a.v_zone, [x for x in a.attrs.split(",") if x])
     now = dt.datetime.now(dt.timezone.utc)
     history = {}
     devices = [] if a.history else api.call("GET", "/devices")
@@ -378,8 +386,9 @@ def main():
         pts = [{"dev": d["name"], "t": parse_time(p["fixTime"]), "lat": p["latitude"], "lon": p["longitude"],
                 "speed": (p.get("speed") or 0) * 1.852, "valid": p.get("valid", True),
                 **{k: (p.get("attributes") or {}).get(a) for k, a in (("ign", "ignition"), ("motion", "motion"),
-                                                                      ("obd", "obdSpeed"), ("rpm", "rpm"),
-                                                                      ("auto", "autostart"))}}
+                                                                      ("obd", "obdSpeed"), ("rpm", "rpm"))},
+                "attrs": {k: v for k, v in (p.get("attributes") or {}).items()
+                          if k in ("autostart", "locked", "rpm", "alarm", "armed", "blocked")}}
                for p in pts if p.get("latitude") or p.get("longitude")]
         history[d["name"]] = sorted(pts, key=lambda p: p["t"])
         print(f"{d['name']}: {len(pts)} точек", file=sys.stderr)
