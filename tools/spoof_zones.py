@@ -153,11 +153,14 @@ def in_zone(zones, lat, lon):
 
 
 def moving(p):
-    """Может ли машина ехать: зажигание, датчик движения, обороты или скорость по OBD.
-    Без зажигания, OBD и оборотов (телефоны, походные трекеры) — может: motion у них Traccar считает по скорости GPS."""
+    """Может ли машина ехать. Есть OBD — по скорости OBD; иначе нужны и зажигание, и датчик движения
+    (автозапуск ночью: зажигание есть, а машина стоит; вибрация мотора иногда включает motion на минуту).
+    Без зажигания, OBD и оборотов (телефоны, походные трекеры: motion у них Traccar считает по скорости GPS) — может."""
     if p.get("ign") is None and p.get("obd") is None and p.get("rpm") is None:
         return True
-    return bool(p.get("ign")) or bool(p.get("motion")) or (p.get("obd") or 0) > 0 or (p.get("rpm") or 0) > 0
+    if p.get("obd") is not None:
+        return (p.get("obd") or 0) > 0
+    return bool(p.get("ign")) and bool(p.get("motion"))
 
 
 def replay(points, zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
@@ -261,10 +264,10 @@ def jexl(zones, v_any, v_zone, min_jump, v_still=V_STILL, parking=()):
                         f"{111.32 * math.cos(math.radians(z['lat'])):.4f} * (longitude - {z['lon']})) < {z['radius_km']}")
     dist = ("(lastLatitude ?? null) == null ? 0 : math:hypot(110.57 * (latitude - lastLatitude), "
             "111.32 * math:cos(math:toRadians(lastLatitude)) * (longitude - lastLongitude))")
-    # может ли машина ехать: зажигание, датчик движения, обороты, скорость OBD. Нет зажигания, OBD и оборотов
-    # (телефоны, походные трекеры: motion у них Traccar считает по скорости GPS) — может
+    # может ли машина ехать: есть OBD — скорость OBD > 0; иначе зажигание И датчик движения (автозапуск ночью
+    # даёт зажигание без движения). Нет зажигания, OBD и оборотов (телефоны, походные трекеры) — может
     moving = ("(ignition ?? null) == null && (obdSpeed ?? null) == null && (rpm ?? null) == null ? true : "
-              "((ignition ?? false) ? true : ((motion ?? false) ? true : ((obdSpeed ?? 0) > 0 || (rpm ?? 0) > 0)))")
+              "((obdSpeed ?? null) != null ? obdSpeed > 0 : ((ignition ?? false) ? ((motion ?? false) ? true : false) : false))")
     # время последней настоящей точки: у замороженных и у повторов координат без GPS оно не сдвигается
     anchor = "(lastFixAnchor ?? lastFixTime.getTime())"
     chain = f"{anchor} != lastFixTime.getTime()"      # прошлая заморожена или без GPS на старом месте
