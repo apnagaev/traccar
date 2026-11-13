@@ -97,8 +97,10 @@ def jumps(points, v_jump, min_jump):
     return out
 
 
-def hotspots(history, share=0.05):
-    """Места стоянки устройств: ячейки 0,01°, где лежит больше share всех неподвижных точек устройства."""
+def hotspots(history, share=0.05, min_points=50):
+    """Места стоянки устройств: ячейки 0,01°, где лежит больше share всех неподвижных точек устройства
+    и не меньше min_points точек (иначе устройство с тремя точками за всё время объявляло бы
+    стоянкой любое место — так зона подмены в Долгопрудном считалась стоянкой телефона ap)."""
     out = []
     for name, pts in history.items():
         still = [p for p in pts if p["speed"] < 3]
@@ -106,7 +108,7 @@ def hotspots(history, share=0.05):
         for p in still:
             cells.setdefault((round(p["lat"], 2), round(p["lon"], 2)), []).append(p)
         for key, cp in cells.items():
-            if still and len(cp) / len(still) > share:
+            if still and len(cp) / len(still) > share and len(cp) >= min_points:
                 out.append({"dev": name, "lat": sum(p["lat"] for p in cp) / len(cp),
                             "lon": sum(p["lon"] for p in cp) / len(cp), "share": len(cp) / len(still)})
     return out
