@@ -67,6 +67,8 @@
     <entry key='event.motion.processInvalidPositions'>true</entry>
     <entry key='processing.computedAttributes.enable'>true</entry>
     <entry key='processing.computedAttributes.deviceAttributes'>true</entry>
+    <!-- координаты прошлой точки (lastLatitude, lastSpoofed…) в вычисляемых атрибутах: защита от подмены GPS, tools/spoof_zones.py -->
+    <entry key='processing.computedAttributes.lastAttributes'>true</entry>
     <entry key='processing.engineHours.enable'>true</entry>
     <!-- Выключено намеренно: реальный IP телефона дописывает reverse proxy (атрибут ip), иначе здесь был бы его адрес. -->
     <entry key='processing.remoteAddress.enable'>false</entry>
